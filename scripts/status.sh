@@ -32,7 +32,7 @@ if [[ -n "$STATUS" ]]; then
     DB_AGE=$(echo "$STATUS"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('last_db_write_age_s','none'))" 2>/dev/null)
     ACTIVE=$(echo "$STATUS"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('active_run') or 'none')" 2>/dev/null)
     TC=$(echo "$STATUS"       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['libs']['thermocouples'])" 2>/dev/null)
-    HX=$(echo "$STATUS"       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['libs']['hx711_scales'])" 2>/dev/null)
+    SC=$(echo "$STATUS"       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['libs']['ble_scales'])" 2>/dev/null)
     SHT=$(echo "$STATUS"      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['libs']['sht30'])" 2>/dev/null)
 
     echo "  Sensor file age : ${FILE_AGE}s"
@@ -42,7 +42,7 @@ if [[ -n "$STATUS" ]]; then
     echo "  Library availability:"
     [[ "$TC"  == "True" ]] && echo -e "    Thermocouples : ${GREEN}ok${NC}" || echo -e "    Thermocouples : ${RED}missing (install adafruit-blinka)${NC}"
     [[ "$SHT" == "True" ]] && echo -e "    SHT30 (env)   : ${GREEN}ok${NC}" || echo -e "    SHT30 (env)   : ${RED}missing (install adafruit-circuitpython-sht31d)${NC}"
-    [[ "$HX"  == "True" ]] && echo -e "    HX711 scales  : ${GREEN}ok${NC}" || echo -e "    HX711 scales  : ${RED}missing (install RPi.GPIO)${NC}"
+    [[ "$SC"  == "True" ]] && echo -e "    BLE scales    : ${GREEN}ok${NC}" || echo -e "    BLE scales    : ${RED}missing (pip3 install bleak)${NC}"
 else
     echo -e "  ${YELLOW}Could not reach /api/sensor-status (service may be starting up)${NC}"
 fi

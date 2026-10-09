@@ -2,7 +2,7 @@
 
 Temperature monitoring and fan control system for koji fermentation, built on a Raspberry Pi 4B.
 
-Reads six MAX31850K thermocouples, an SHT30 humidity sensor, and up to four HX711 load cells. Controls six relay-switched fans to hold temperature curves. Serves a real-time web dashboard over the local network.
+Reads six MAX31850K thermocouples, an SHT30 humidity sensor, and four Bluetooth LE scales (one under each table leg). Controls six relay-switched fans to hold temperature curves. Serves a real-time web dashboard over the local network.
 
 <!-- ## Screenshots
 Drop PNGs into `images/` and uncomment:
@@ -82,7 +82,9 @@ The cheat sheet for running SmartSake day-to-day. Detailed background lives in s
 5. **End run** — Dashboard **End Run** button. CSV downloads automatically. localStorage cleared (no phantom run on next visit).
 6. **Crash recovery** — if the dashboard tab dies mid-run, reopening it silently auto-exports the recovered samples to CSV.
 
-### Calibration (load cells)
+### Calibration (leg scales)
+
+The leg scales are already calibrated at the factory — with the defaults (Tare 0, Factor 1.0) each leg reads exactly what that scale's own display would show. The steps below only fine-tune that.
 
 1. **Calibrate All (centered load)** — empty the table → **Tare All**. Place a known total weight at the center → enter total kg → **Calibrate All** (splits weight evenly across the 4 cells).
 2. **Single cell** — per-row **Tare** (with that cell empty) then **Calibrate** with a known weight on just that cell.
@@ -105,7 +107,8 @@ The cheat sheet for running SmartSake day-to-day. Detailed background lives in s
 | Disk getting tight? | Home page **System Health** → Disk free. Threshold warnings start at 100 MB. |
 | Multiple "active" runs? | Home page **System Health** → Active runs (should be 0 or 1). The DB now auto-supersedes leftovers on next run start. |
 | Smoke-test the fan logic | `python3 test_fan_state.py` — exercises the override / hysteresis / shutdown paths |
-| Deeper debug playbook | [`DEBUG.md`](DEBUG.md) — symptom → cause trees for auto fan switching and load cell calibration |
+| Leg scale offline? | Home page **System Health** → Scale N shows `disconnected` / `rezero_suspected`. Logs: `journalctl -u smartsake \| grep '\[scale'` |
+| Deeper debug playbook | [`DEBUG.md`](DEBUG.md) — symptom → cause trees for auto fan switching and the BLE leg scales |
 
 ---
 
@@ -167,7 +170,7 @@ Quick reference — for the full Bill of Materials with vendors, part numbers, a
 | Thermocouple amplifier | MAX31850K (1-Wire) | 6 |
 | Humidity/temp sensor | SHT30 (I2C) | 1 |
 | Relay board | SunFounder TS0012 (active-LOW, 8-ch) | 1 |
-| Load cell amplifier | HX711 | 1-4 |
+| Leg scales | THINKSCALE 440 lb shipping scale w/ wireless display (BLE name `Chipsea_BLE`), each on its own AC adapter | 4 |
 | Fans | 12V DC (one per zone) | up to 6 |
 
 ### GPIO Pin Map (BCM numbering)
@@ -176,15 +179,7 @@ Quick reference — for the full Bill of Materials with vendors, part numbers, a
 Pin  2 ── SHT30 SDA (I2C)
 Pin  3 ── SHT30 SCL (I2C)
 Pin  4 ── 1-Wire data bus (all six MAX31850K)
-Pin  5 ── HX711 Scale 1 DAT
-Pin  6 ── HX711 Scale 1 CLK
-Pin 12 ── HX711 Scale 2 DAT
-Pin 15 ── HX711 Scale 2 CLK   (UART RXD0 — disable serial console if used)
-Pin 16 ── HX711 Scale 3 DAT
 Pin 17 ── Relay CH5 → Fan Zone 5
-Pin 19 ── HX711 Scale 3 CLK
-Pin 20 ── HX711 Scale 4 DAT
-Pin 21 ── HX711 Scale 4 CLK
 Pin 22 ── Relay CH4 → Fan Zone 4
 Pin 23 ── Relay CH3 → Fan Zone 3
 Pin 24 ── Relay CH2 → Fan Zone 2
@@ -192,7 +187,7 @@ Pin 25 ── Relay CH1 → Fan Zone 1
 Pin 27 ── Relay CH6 → Fan Zone 6
 ```
 
-> **Reserved pins:** 2/3 (I2C), 4 (1-Wire), 5/6/12/15/16/19/20/21 (HX711). Do not use these for relays.
+> **Reserved pins:** 2/3 (I2C), 4 (1-Wire). The leg scales are Bluetooth and use no GPIO (the old HX711 pins 5/6/12/15/16/19/20/21 are free).
 
 ### Relay Wiring (Active-LOW)
 
@@ -229,19 +224,29 @@ This creates `tc_zone_map.json` — the sensor loop will not start until all six
 
 The SHT30/SHT31 connects to the default I2C bus (pins 2/3). Enable I2C in `raspi-config` if not already on. No additional configuration needed.
 
-### HX711 Load Cells
+### Bluetooth Leg Scales (`ble_scales.py`)
 
-Scale 1 uses GPIO 5 (DAT) and GPIO 6 (CLK). Scales 2-4 are defined in `scale_config.json` but not wired by default. To calibrate:
+Each table leg stands on a THINKSCALE 440 lb shipping scale. These scales send their readings over Bluetooth LE to a wireless display; SmartSake takes the display's place and connects to all four scales from the Pi's built-in Bluetooth radio (BlueZ + the `bleak` Python library). No wiring beyond each scale's AC adapter.
+
+**Things to know about these scales**
+
+- **One connection at a time.** While the Pi is connected the scale's wireless display stays blank. Keep the four displays switched off / unplugged, otherwise a display can grab its scale first.
+- **Discoverable only after power-up.** A scale advertises its name (`Chipsea_BLE`) after power-on until something connects; afterwards it only re-advertises to the device it last talked to. The Pi reconnects on its own after link drops. If a display grabbed a scale, power-cycle that scale with the display off.
+- **Auto-zero at power-up.** Power the scales on with the table empty — or at least with the same load you want to read as zero. If a scale loses power while the table is loaded it silently re-zeros; SmartSake detects the jump (reading before the drop ≥ 1 lb, ~0 after reconnect), logs a warning and shows the leg as `rezero_suspected` on the System Health card until the next Tare/Calibrate. Put the scales on a UPS for unattended runs.
+- **Always lb, 0.01 lb resolution.** The scale boots in lb; SmartSake decodes the LCD digits it transmits (see the protocol notes at the top of `ble_scales.py`).
+
+**Assign scales to legs** (service stopped, displays off):
 
 ```bash
-python3 load_cell_hx711.py --calibrate --scale 1
+sudo systemctl stop smartsake
+python3 ble_scales.py setup          # unplug all scales, then plug in one leg at a time when prompted
+python3 ble_scales.py list           # show leg → address assignments
+sudo systemctl start smartsake
 ```
 
-To re-tare without full calibration:
+Other commands: `python3 ble_scales.py scan` (list nearby scales), `python3 ble_scales.py assign <leg> <address>` (manual), `python3 ble_scales.py monitor` (live readings without the web app — stop the service first).
 
-```bash
-python3 load_cell_hx711.py --tare --scale 1
-```
+Legs without an address are skipped and shown as `not_wired` (blank weight). Weight totals sum whichever legs are reporting, so you can run with a single scale.
 
 ---
 
@@ -252,14 +257,19 @@ python3 load_cell_hx711.py --tare --scale 1
 ```bash
 # System packages
 sudo apt update
-sudo apt install python3 python3-pip git
+sudo apt install python3 python3-pip git bluez
 
-# Python dependencies
-pip3 install flask gunicorn
+# Python dependencies (add --break-system-packages on Raspberry Pi OS Bookworm+)
+pip3 install flask gunicorn bleak
 
 # Pi hardware libraries
 pip3 install RPi.GPIO
 pip3 install adafruit-blinka adafruit-circuitpython-sht31d
+
+# Bluetooth for the leg scales: radio on, service user allowed to use BlueZ
+sudo rfkill unblock bluetooth
+sudo systemctl enable --now bluetooth
+sudo usermod -aG bluetooth $USER    # log out/in afterwards
 ```
 
 ### Clone the Repo
@@ -300,7 +310,7 @@ Three JSON files control hardware mapping. They live in the project root:
 
 Optional per-zone fields: `setpoint_c`, `offset_c` (legacy single-point cal), `cal_slope` + `cal_intercept` (two-point cal).
 
-**`scale_config.json`** — Load cell calibration and SHT30 offset:
+**`scale_config.json`** — Leg scale assignment, calibration and SHT30 offset:
 
 ```json
 {
@@ -309,16 +319,19 @@ Optional per-zone fields: `setpoint_c`, `offset_c` (legacy single-point cal), `c
   },
   "scales": {
     "1": {
-      "dat_pin": 5,
-      "clk_pin": 6,
-      "tare_offset": 4166,
-      "calibration_factor": 8000,
-      "units": "kg",
-      "label": "Scale 1"
+      "address": "A4:C1:38:12:34:56",
+      "label": "Leg 1",
+      "tare_offset": 0,
+      "calibration_factor": 1.0
     }
   }
 }
 ```
+
+- `address` — Bluetooth address of that leg's scale (`null` = leg not in use). Written by `python3 ble_scales.py setup` / `assign`; changing it resets that leg's calibration. Address changes need a service restart; tare/factor changes are hot-reloaded.
+- `tare_offset` — grams subtracted from the scale's reading (set by **Tare**).
+- `calibration_factor` — raw grams per true gram (≈1.0; **Calibrate** sets it).
+- `calibration_points` (optional) — multi-point curve `[{raw, weight_g, label}]` in grams, overrides tare/factor when ≥ 2 points.
 
 ### Install systemd Services
 
@@ -380,7 +393,7 @@ If systemd is not installed (development mode), `restart.sh` runs `server.py` di
 
 1. Wire all hardware and enable 1-Wire + I2C in `raspi-config`
 2. Run `python3 scripts/identify_tcs.py` to create `tc_zone_map.json`
-3. Run `python3 load_cell_hx711.py --calibrate --scale 1` (if using a scale)
+3. Assign the Bluetooth leg scales: `python3 ble_scales.py setup` (displays off)
 4. Install services: `sudo bash systemd/install.sh`
 5. Open `http://<pi-ip>:8080` in a browser
 
@@ -489,7 +502,7 @@ including `/api/sensor-status`, `/api/tc-probes`, `/api/tc-zone-map`,
 `/api/runs/<id>/summary`, `/api/reference-curves/generate[-from-csv]`,
 `/api/runs/<id>/emergency-stop`, `/api/fans/<zone>`, and `/api/prune`.
 
-All hardware imports degrade gracefully — `RPi.GPIO`, `adafruit_sht31d`, and HX711 log warnings and run as no-ops when unavailable.
+All hardware imports degrade gracefully — `RPi.GPIO`, `adafruit_sht31d`, and `bleak` (BLE scales) log warnings and run as no-ops when unavailable. Missing sensors simply read blank: you can run with no thermocouples, no SHT30, and only some of the four leg scales.
 
 ---
 
@@ -512,7 +525,7 @@ Find the Pi's IP with `hostname -I` on the Pi, or check your router's device lis
 | Home | `/` | Start/resume runs, view history |
 | Dashboard | `/dashboard.html?run=N&mode=live` | Real-time temp, fan, and weight monitoring |
 | Mobile | `/mobile.html` | Lightweight phone/tablet view |
-| Calibration | `/calibration.html` | TC offset and load cell calibration |
+| Calibration | `/calibration.html` | TC offset and leg scale calibration |
 | Curve Builder | `/curves.html` | Create/edit temperature reference curves |
 | History | `/history.html?run=N` | Detailed run data table |
 | Summary | `/summary.html?run=N` | Hourly temperature statistics |
@@ -535,7 +548,7 @@ The main dashboard is designed for a wall-mounted display. It shows:
 - **Six zone cards** — current temperature, fan state (ON/OFF badge), and deviation from target
 - **Temperature chart** — live line graph updated every 10 seconds
 - **Fan state indicators** — mode (limit/manual/rule), setpoint, trigger point, alarm level
-- **Weight chart** — load cell readings updated every 30 seconds
+- **Weight chart** — leg scale readings (sampled every 5 s, published with each 10 s sensor tick)
 - **Humidity/ambient** — SHT30 environment readings
 - **Zone controls** — click any zone card to open fan overrides, rules, notes, and calibration
 - **Update Setpoints card** — opens a blanket-only modal: enter one setpoint and/or one tolerance, click Apply, and the values are written to every zone in a single atomic POST to `/api/zone-config/all` (RLock-guarded on the server). Per-zone edits live on each zone card's existing detail modal
@@ -622,7 +635,7 @@ The backend auto-derives `tare_offset` and `calibration_factor` from the min-wei
 | Temperature (TC) | 10s | 10s |
 | Humidity (SHT30) | 10s | 10s |
 | Fan relay control | 10s | 10s |
-| Weight (HX711) | 30s | 30s |
+| Weight (BLE leg scales) | 5s (scales push on change) | 30s |
 | Stage markers | on change | 30s |
 
 Front-end pollers (`fetchAndApply`, `fetchFanState`) carry an in-flight reentrancy guard, so a slow Pi will skip a tick instead of stacking parallel requests.
@@ -649,7 +662,7 @@ SmartSake/
 ├── db.py                  # SQLite database layer
 ├── fan_gpio.py            # GPIO relay abstraction
 ├── sensors.py             # 1-Wire and SHT30 helpers
-├── load_cell_hx711.py     # HX711 ADC driver and calibration CLI
+├── ble_scales.py          # Bluetooth leg-scale driver + setup/monitor CLI
 ├── home.html              # Landing page
 ├── dashboard.html         # Main monitoring dashboard
 ├── dashboard-phase2.js    # Stage markers + weight analytics overlay
@@ -665,7 +678,7 @@ SmartSake/
 ├── requirements.txt       # Python dependencies
 ├── tc_zone_map.json       # Probe-to-zone mapping (generated)
 ├── zone_config.json       # Per-zone tolerance and calibration
-├── scale_config.json      # Load cell config and SHT30 offset
+├── scale_config.json      # Leg scale addresses/calibration and SHT30 offset
 ├── smartsake.db           # SQLite database (auto-created)
 ├── sensor_data.csv        # Rolling CSV log (~24 hrs)
 ├── archive/
@@ -739,7 +752,7 @@ The native Fusion 360 file (`SakeTableCAD.f3z`) is not included due to size; con
 | [`docs/schematics/power-schematic.pdf`](docs/schematics/power-schematic.pdf) | Power distribution schematic |
 | [`docs/schematics/wiring-schematic.pdf`](docs/schematics/wiring-schematic.pdf) | Full wiring schematic (Pi → relays → fans → sensors) |
 | [`docs/schematics/signal-schematic.svg`](docs/schematics/signal-schematic.svg) | Signal-level schematic (1-Wire, I2C, GPIO) |
-| [`docs/schematics/smartsake-wiring.json`](docs/schematics/smartsake-wiring.json) | Editable EasyEDA source — Sheet 1: LV signal wiring (Pi GPIO → MAX31850K × 6, SHT30, HX711 × 4, relay logic). Sheet 2: 120 VAC power wiring (separate Pi-supply outlet, relay-switched fans, always-on dehumidifier). Open in EasyEDA Std Edition via *File → Open → Local*. |
+| [`docs/schematics/smartsake-wiring.json`](docs/schematics/smartsake-wiring.json) | Editable EasyEDA source — Sheet 1: LV signal wiring (Pi GPIO → MAX31850K × 6, SHT30, HX711 × 4 (historical — scales are now Bluetooth), relay logic). Sheet 2: 120 VAC power wiring (separate Pi-supply outlet, relay-switched fans, always-on dehumidifier). Open in EasyEDA Std Edition via *File → Open → Local*. |
 
 ---
 
@@ -752,7 +765,8 @@ All standalone — no pytest, no hardware required. Each prints PASS/FAIL with a
 - `python3 test_config_robustness.py` — JSON config loaders (`zone_config.json`, `scale_config.json`, `tc_zone_map.json`, `no_run_overrides.json`, and `server._read_json_cached`) under empty/truncated/trailing-comma/non-UTF8/wrong-type/extreme-value inputs. Verifies graceful degradation.
 - `python3 test_db_safety.py` — SQLite layer: fresh init, idempotent re-init, `PRAGMA integrity_check` on corruption, `create_run` superseding leftover active runs, `end_run` closing open deviation events, schema migration paths, and threadlocal connection isolation. Uses temp DBs via `tempfile.NamedTemporaryFile` — never touches `smartsake.db`.
 - `python3 test_input_fuzz.py` — Flask API endpoints (test_client, no port binding): empty bodies, malformed JSON, wrong types, extreme numerics (Infinity / NaN / 1e300), unicode, oversize strings, bogus path params. Verifies 4xx not 5xx.
-- `python3 test_failure_injection.py` — failure-injection: monkey-patches `set_fan`, `insert_reading`, `read_temp_c`, `HX711.get_weight`, `read_sht30`, `_load_zone_config`, `_persist_no_run_overrides`, etc. to raise mid-tick. Verifies the sensor loop, fan-eval, HX711 thread, and watchdog all degrade gracefully (log + continue) rather than crashing.
+- `python3 test_failure_injection.py` — failure-injection: monkey-patches `set_fan`, `insert_reading`, `read_temp_c`, scale `get_weight`, `read_sht30`, `_load_zone_config`, `_persist_no_run_overrides`, etc. to raise mid-tick. Verifies the sensor loop, fan-eval, scale reader thread, and watchdog all degrade gracefully (log + continue) rather than crashing.
+- `python3 test_ble_scales.py` — BLE leg-scale driver: decodes LCD frames captured from a real scale, frame reassembly, calibration math, offline/grace handling, power-cycle re-zero detection, and the connection manager end-to-end against a fake BLE stack (reconnect, absent scale, serialized connects).
 - `python3 test_concurrency.py` — threading/race stress: mtime-cached config readers (`scale_config.json`, `zone_config.json`, server's `_read_json_cached`), SQLite thread-local pool isolation under 8×100 concurrent inserts, `_no_run_overrides_lock` set/clear/purge/expiry hammer, fan-state atomic-write rename safety, and concurrent `_write_scale_cfg` (Calibrate-All) lost-update detection. Mocks `RPi.GPIO`, uses `tempfile` so it never touches real config or `smartsake.db`.
 
 ### Dashboard won't load / can't reach Pi
@@ -783,11 +797,13 @@ sudo systemctl restart smartsake
 ### Fan stays ON after clicking Auto
 Clearing a manual ON override now also resets the auto-loop hysteresis (`_fan_on=False`, `_fan_hold_counts=0`) so the next auto evaluation starts from a fresh "fan off" baseline. Previously the fan could stay on indefinitely if the actual temp was inside the deadband (setpoint < actual ≤ trigger) because hysteresis preserved the manual ON state. Auto now re-evaluates fresh and only turns the fan back on when actual truly exceeds the trigger. Same behavior applies when a timed override expires naturally.
 
-### Scale reads zero or drifts
-- Re-tare without recalibrating: `python3 load_cell_hx711.py --tare --scale N`
-- Full calibration with a known weight: `python3 load_cell_hx711.py --calibrate --scale N`
-- Confirm DAT/CLK pins in `scale_config.json` match the wiring (defaults: 5/6 for scale 1)
-- HX711 is sensitive to vibration and temperature swings; mount it rigidly
+### Leg scale blank, disconnected, or reads wrong
+- **Blank / `not_wired`** — that leg has no `address` in `scale_config.json`. Run `python3 ble_scales.py setup` (service stopped).
+- **`disconnected`** — the Pi can't reach the scale. Check it has power; make sure its wireless display is off (the scale accepts one connection, and once the display has it the scale stops advertising to the Pi). Power-cycle the scale with the display off; the Pi reconnects within ~1 min. Logs: `journalctl -u smartsake | grep '\[scale'`.
+- **`rezero_suspected`** — the scale lost power under load and re-zeroed at power-up. Unload the table, power-cycle the scale, then **Tare** it on the calibration page (that also clears the warning).
+- **Reads ~1 % off** — use **Calibrate** with a known weight; the factor will land near 1.0.
+- **Nothing found at all** — `bluetoothctl show` should list a powered controller; `sudo rfkill unblock bluetooth`; the service user must be in the `bluetooth` group (`sudo usermod -aG bluetooth $USER`, then log out/in).
+- Watch raw readings without the web app: `sudo systemctl stop smartsake && python3 ble_scales.py monitor`
 
 ### "Database is locked"
 Another process is writing. Stop everything and restart cleanly:
@@ -898,7 +914,7 @@ This is an active capstone project. If you are on the team:
 
 1. Work on the `ClaudeAgents` branch — `main` and `zany` are protected
 2. Update [`README.md`](README.md) whenever you change wiring, GPIO assignments, config schemas, scripts, or systemd units (see [`CLAUDE.md`](CLAUDE.md) for the full rule set)
-3. Hardware imports (`RPi.GPIO`, `adafruit_sht31d`, HX711) must degrade gracefully so the code still imports on a dev laptop — wrap in try/except and log a warning
+3. Hardware imports (`RPi.GPIO`, `adafruit_sht31d`, `bleak`) must degrade gracefully so the code still imports on a dev laptop — wrap in try/except and log a warning
 4. Run the mock server locally before pushing changes that touch the dashboard:
    ```bash
    python archive/mock_server.py
@@ -918,5 +934,5 @@ This project is released for academic and educational use. Hardware designs (CAD
 
 - **Dr. Alicia Modenbach** — capstone advisor, BAE Department
 - **University of Kentucky Biosystems & Agricultural Engineering** — capstone program, lab space, fabrication resources
-- **Open-source projects:** Flask, Adafruit CircuitPython libraries, Chart.js, the HX711 driver community
+- **Open-source projects:** Flask, Adafruit CircuitPython libraries, Chart.js, the bleak Bluetooth LE library
 - **The brewing community** — for centuries of documented technique that made the temperature curves possible

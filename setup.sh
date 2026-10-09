@@ -18,7 +18,7 @@ SERVICE_NAME="smartsake"
 TC_ZONE_MAP="$SCRIPT_DIR/tc_zone_map.json"
 W1_BUS="/sys/bus/w1/devices"
 IDENTIFY_SCRIPT="$SCRIPT_DIR/scripts/identify_tcs.py"
-CALIBRATE_SCRIPT="$SCRIPT_DIR/load_cell_hx711.py"
+SCALES_SCRIPT="$SCRIPT_DIR/ble_scales.py"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}✓${NC} $*"; }
@@ -276,10 +276,11 @@ info "Step 3/4 — Verifying additional sensors..."
 check_sht30
 echo ""
 
-# Optional: scale calibration
-read -rp "  Calibrate load cell (HX711)? [y/N] " CAL
+# Optional: assign the Bluetooth leg scales (displays OFF, service stopped)
+read -rp "  Assign Bluetooth leg scales? [y/N] " CAL
 if [[ "${CAL,,}" == "y" ]]; then
-    python3 "$CALIBRATE_SCRIPT" --calibrate --scale 1
+    sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    python3 "$SCALES_SCRIPT" setup
 fi
 echo ""
 

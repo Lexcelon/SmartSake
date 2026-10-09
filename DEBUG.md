@@ -1,6 +1,6 @@
 # SmartSake Debug Playbooks
 
-Two systems land in the field with the most ways to misbehave: **automatic relay switching** and **load cell calibration**. Each section below walks how it works, what to look at, the command cookbook, and a symptom → cause decision tree.
+Two systems land in the field with the most ways to misbehave: **automatic relay switching** and the **Bluetooth leg scales**. Each section below walks how it works, what to look at, the command cookbook, and a symptom → cause decision tree.
 
 When in doubt, read the live state files first (`/run/smartsake/*.json`) before assuming the code is wrong. The state files are produced by the same loop that drives the relays, so they tell you exactly what the loop *thinks* is happening.
 
@@ -161,27 +161,37 @@ This is downstream of GPIO. Confirm with a multimeter at the relay terminals (NO
 
 ---
 
-# Part 2 — Load cell calibration
+# Part 2 — Bluetooth leg scales
 
 ## How it works
 
-Each scale 1–4 has its own HX711 amplifier on a unique `(DAT, CLK)` GPIO pair. `start_sensor_loop()` reads `scale_config.json`, instantiates one `HX711` per configured scale (those with non-null pins), and spawns a daemon thread per scale via `run_hx711_thread`.
-
-### The HX711 thread (every `WEIGHT_INTERVAL_S = 30s`)
+Each table leg stands on a THINKSCALE 440 lb shipping scale that normally talks to its own wireless display over Bluetooth LE (advertised name `Chipsea_BLE`). SmartSake replaces the displays: `ble_scales.py` keeps one BLE connection per scale from a single asyncio thread (`BleScaleManager`), and `WriteSensors.run_scale_thread` (one per leg) copies the latest reading into `weight_state` every `WEIGHT_INTERVAL_S = 5s`.
 
 ```
-hot-reload scale_config.json by mtime → push new tare/factor/points into the live HX711 instance
-get_weight(samples=10) → median-filtered raw, weight_kg
-write to weight_state[scale_id] (in-memory, primary path)
-write scale_<id>_data.json (secondary log)
-sleep 30s
+scale ──notify FFF1──► FrameParser ► decode_frame (LCD segments → lb) ► BleScale._on_frame
+run_scale_thread: hot-reload scale_config.json → BleScale.get_weight() → weight_state[leg]
+sensor loop (10 s): weight_state → sensor_latest.json (+ "scale_status") → DB / dashboard
 ```
 
-Hot-reload means **edits to `scale_config.json` take effect within ~30s** without service restart. The dashboard calibration API uses this exact path.
+### What the scale sends
+
+11-byte frames `C5 08 50 02 00 08 xx xx xx xx cs` (cs = XOR of all previous bytes), sent **only when the displayed value changes**. The payload is the LCD's 7-segment map — `decode_frame` turns it back into digits. Always lb with two decimals (the scale boots in lb). Short `C5 02 55 ..` frames are an unknown status message and are ignored. Full notes at the top of `ble_scales.py`.
+
+### Link rules that cause most problems
+
+- **One connection per scale.** If a wireless display is powered it may take the scale first; the Pi then can't connect. Keep displays off.
+- **Advertising.** After power-up a scale advertises its name until something connects. After a disconnect it re-advertises only to the last device it talked to. So the Pi reconnects on its own, but if the display grabbed a scale, power-cycle the scale with the display off.
+- **Auto-zero at power-up.** A scale that loses power under load comes back reading ~0. `BleScale` flags this when a leg read ≥ 1 lb before a disconnect and ≤ 0.05 lb right after reconnecting: log line `WARNING: read X lb before the link dropped…`, `/api/health` status `rezero_suspected`. Any tare/calibration change for that leg clears the flag.
+- **Offline handling.** After a disconnect the last value is kept for `OFFLINE_GRACE_S = 600 s` (so a short link blip doesn't punch a hole in the weight trend); after that the leg reads `None` (blank) and `/api/health` shows `disconnected`.
+- **Single owner.** A file lock (`/tmp/smartsake_ble_scales.lock`) makes sure only one process connects to the scales. `ble_scales.py monitor` refuses to run while the service is up.
+
+### Calibration on top of the scale's own reading
+
+`raw` is the scale's reading in **grams**. With `tare_offset = 0` and `calibration_factor = 1.0` (the defaults written by `ble_scales.py setup`) the weight equals the scale display. The calibration page / API only fine-tune it.
 
 ### Two calibration modes
 
-- **Single-point** — `tare_offset` (raw with empty cell) + `calibration_factor` (raw delta per gram). Math: `(raw - tare_offset) / calibration_factor = grams`. Falls into this mode when no `calibration_points` array is present.
+- **Single-point** — `tare_offset` (raw grams with the leg empty) + `calibration_factor` (raw grams per true gram, ≈1.0). Math: `(raw - tare_offset) / calibration_factor = grams`. Falls into this mode when no `calibration_points` array is present.
 - **Multi-point** — `calibration_points: [{raw, weight_g, label}, …]`. Requires ≥2 points. Piecewise-linear interp inside the range; nearest-segment slope extrapolated outside. Whenever ≥2 points exist, the server **also** auto-derives legacy `tare_offset` and `calibration_factor` from the min and max points for backwards compat.
 
 ### Server endpoints (calibration page)
@@ -197,116 +207,83 @@ All wrap their config writes in `_AtomicCfgSection` (RLock + atomic file replace
 | `POST /api/scale-config/<id>/clear-cal-points` | Drops `calibration_points`. Falls back to single-point. |
 | `POST /api/scales/calibrate-all` | Splits a known total weight evenly across 4 cells, calibrates each. |
 
-### Raw value sanity
-
-HX711 24-bit signed range is ±8388608. The driver clamps to ±9000000 (a clipped/floating value gets `[SKIP] Rejected bad raw read` and falls out of the average). With 10 samples per read, the median filter rejects values >1.5×IQR from the median (or a min margin of 500). If all 10 reads are bad, `read_average` raises `ValueError("No valid readings -- check wiring")`.
-
-### `_offset` of 0 vs `tare_offset` of 0
-
-A factory-fresh `scale_config.json` has `tare_offset: 0` for unwired scales — that's not "tared", it's "uncalibrated". You can tell by checking `cat scale_config.json | jq '.scales."N".tare_offset'` against the live raw — if they're far apart, this scale was never tared.
-
----
-
-## Diagnostic command cookbook (load cell)
+## Diagnostic command cookbook (leg scales)
 
 ```bash
-# What's wired and what's calibrated?
-python3 load_cell_hx711.py --list
-# → Scale 1 (Scale 1): pins=5/6 [configured], calibration [single-point]
-# → Scale 4 (Scale 4): pins=20/21 [configured], calibration [uncalibrated]
+# Which leg is which scale, and calibration summary
+python3 ble_scales.py list
 
-# Live raw + weight, all 4 scales
-watch -n 1 'cat /run/smartsake/sensor_latest.json | jq "{w1: .weight_kg_1, w2: .weight_kg_2, w3: .weight_kg_3, w4: .weight_kg_4, raw1: .weight_raw_1, raw2: .weight_raw_2, raw3: .weight_raw_3, raw4: .weight_raw_4}"'
+# Link + weight status per leg (status: ok / not_wired / disconnected / no_data / rezero_suspected)
+curl -s http://localhost:8080/api/health | jq .scales
 
-# Or via API (same data path, no jq)
-curl -s http://localhost:8080/api/sensor-latest | jq '.weight_kg_1, .weight_raw_1'
+# Detailed link state the sensor loop published (connected, last frame age, last error, re-zero flag)
+jq .scale_status /run/smartsake/sensor_latest.json
+jq '{weight_kg_1, weight_raw_1}' /run/smartsake/sensor_latest.json
 
-# Just the config for one scale
-cat scale_config.json | jq '.scales."1"'
+# Scale log lines (connects, disconnects, offline reasons, re-zero warnings)
+journalctl -u smartsake -f | grep -E '\[scale [0-9]|\[ble-scales\]'
 
-# HX711 init + read errors in the live log
-journalctl -u smartsake -f | grep -E 'HX711|scale [0-9]'
+# Is Bluetooth up? (controller should be "Powered: yes")
+bluetoothctl show
+sudo rfkill list bluetooth
 
-# Boot log — did each scale init?
-journalctl -u smartsake -b | grep -E 'HX711.*initialized|scale [0-9].*calibration'
-
-# Re-tare a single scale (CLI, requires service stopped — both will fight for the GPIO)
+# Find scales that are advertising right now (only freshly powered, unconnected scales show up)
 sudo systemctl stop smartsake
-python3 load_cell_hx711.py --tare --scale 1
+python3 ble_scales.py scan
+
+# Re-assign legs (guided: plug in one scale at a time)
+python3 ble_scales.py setup
+
+# Live readings straight from the scales, no web app (service must be stopped)
+python3 ble_scales.py monitor -v
 sudo systemctl start smartsake
 
-# Single-point cal via CLI (same caveat — stop the service first)
-python3 load_cell_hx711.py --calibrate --scale 1
-
-# Multi-point cal via CLI
-python3 load_cell_hx711.py --calibrate-multipoint --scale 1
-
-# Smoke test — read each configured scale 10× and print raw + weight
-python3 test_scales.py
-
-# Live re-tare via API (service running, no stop needed)
+# Live re-tare via API (service running)
 curl -X POST http://localhost:8080/api/scale-config/1/tare
 
 # Live single-point cal via API (place known weight first)
 curl -X POST -H 'Content-Type: application/json' \
-  -d '{"kg": 2.5}' \
+  -d '{"known_weight_kg": 2.5}' \
   http://localhost:8080/api/scale-config/1/calibrate
 
-# Manual set (skip the read, type in known-good values)
-curl -X POST -H 'Content-Type: application/json' \
-  -d '{"tare_offset": 4166, "calibration_factor": 8000}' \
-  http://localhost:8080/api/scale-config/1/manual-set
-
-# Clear multi-point curve
-curl -X POST http://localhost:8080/api/scale-config/1/clear-cal-points
+# Driver tests (no hardware)
+python3 test_ble_scales.py
 ```
 
-## Symptom → cause decision tree (load cell)
+## Symptom → cause decision tree (leg scales)
 
-### "Scale shows 0 / never updates"
+### "Leg shows blank / `not_wired`"
 
-1. **Is the scale even configured?** `python3 load_cell_hx711.py --list` — if it shows `[not wired]`, `dat_pin`/`clk_pin` are null in `scale_config.json`. Set them, restart service.
-2. **Did the HX711 init?** `journalctl -u smartsake -b | grep "HX711 scale 1 initialized"` should be there. If you see `[WARN] Scale 1 failed to init: ...`, the cause is in the message — usually `RPi.GPIO.setup` failing on a reserved pin or `HX711 not responding -- check wiring!`.
-3. **Pin conflict.** If you've put a fan relay or another HX711 on a reserved pin, both will fight. Cross-check `fan_gpio.FAN_PINS` and `scale_config.json`. The **GPIO map** in `CLAUDE.md` is authoritative.
-4. **Serial console blocking pin 15** (scale 2 CLK). `sudo raspi-config` → Interface → Serial Port → No login shell, **Yes** hardware. Reboot.
-5. **Wiring.** Float on DAT (jumper unseated) → driver hits `TimeoutError("HX711 not responding")` after 1 s and the read fails. Check continuity DAT and CLK.
+The leg has no `address` in `scale_config.json`. Run `python3 ble_scales.py setup` (service stopped) or `python3 ble_scales.py assign <leg> <address>`, then restart the service. Address changes are not hot-reloaded.
 
-### "Weight is wildly off"
+### "Leg shows `disconnected` / `not found`"
 
-1. **Is the cell tared?** Empty raw should be near `tare_offset`. `cat scale_config.json | jq '.scales."1".tare_offset'` vs `cat /run/smartsake/sensor_latest.json | jq '.weight_raw_1'`. Near-equal under empty load = tared. Far apart = re-tare.
-2. **Sign flipped.** If load makes weight go *negative*, the cell's signal A+/A- is swapped. Either swap the wires or accept a negative `calibration_factor` (works fine — math is symmetric).
-3. **Factor calibrated against the wrong weight.** Replace via `--calibrate` CLI or the dashboard. Math sanity: `(raw_under_load - tare_offset) / known_weight_grams = factor`. The shipping default `calibration_factor = 8000` is a placeholder for the FX29X 040A — your physical cell will land somewhere around there but rarely exactly.
-4. **Multi-point overrides single-point.** If `calibration_points` array exists (≥2 entries), it wins. Check `cat scale_config.json | jq '.scales."1".calibration_points'`. Either delete the array (`/clear-cal-points` endpoint) or recalibrate it.
+1. **Power.** Is the scale's AC adapter in? Its own LCD (platform side, if any) or a quick `bluetoothctl scan le` after power-cycling tells you it is alive.
+2. **Display holding it.** If that scale's wireless display is on, it may own the connection. Switch the display off, power-cycle the scale. The Pi retries with backoff up to 60 s.
+3. **Bluetooth stack.** `bluetoothctl show` → `Powered: yes`. If not: `sudo rfkill unblock bluetooth && sudo systemctl restart bluetooth`. Error `[Errno 2] No such file or directory` / `org.freedesktop.DBus.Error...` means BlueZ isn't running.
+4. **Permissions.** The service user must be in the `bluetooth` group: `groups` → add with `sudo usermod -aG bluetooth <user>`, then reboot.
+5. **Range / too many links.** The Pi 4's built-in radio handles four LE links, but metal tables, the fan motors and Wi-Fi traffic shorten range. Move the Pi closer, or add a USB Bluetooth dongle.
+6. **After a service restart nothing reconnects.** The scales only re-advertise to their last peer. That should be this Pi; if it isn't (someone connected a phone/laptop), power-cycle the scales.
 
-### "Weight drifts / wanders by hundreds of grams"
+### "Leg shows `rezero_suspected` / total weight suddenly dropped"
 
-1. **HX711 warm-up.** The amp is temperature-sensitive. After power-on, give it 5–10 min before calibrating or trusting weights. Watching `weight_raw_N` in `sensor_latest.json` should show the drift settling.
-2. **Mechanical creep.** The 233 FX29X is a strain gauge — under sustained load it can creep ~0.1% over hours. For a 60 kg load, that's ±60 g. Visible in `room-history.html`.
-3. **Vibration / cable microphonics.** Unshielded HX711 cabling near the fan motor or the AC contactor will pick up noise. Route HX711 wiring away from the relay board and AC mains. Twist DAT/CLK pairs.
-4. **Excitation supply sag.** HX711 is ratiometric, so excitation noise mostly cancels — but if 5V rail is sagging hard (Pi underpowered, weak USB-C supply), you'll see drift correlated with CPU load.
+The scale power-cycled with the table loaded and auto-zeroed. Readings for that leg are now low by whatever it was carrying. Fix: unload the table, power-cycle that scale, and **Tare** it on the calibration page (clears the warning). Prevent it: UPS for the scales' adapters.
+
+### "Weight is off by ~1 %"
+
+The scale itself reads slightly high/low (seen: +0.5–1 %). Use **Calibrate** with a known weight on that leg — the factor should land near 1.0. A factor far from 1.0 (the loader warns outside 0.5–2.0) usually means a leftover HX711 value; reset it with `manual-set` (`tare_offset` 0, `calibration_factor` 1.0).
+
+### "Weight jumps in 0.02–0.05 lb steps / looks quantised"
+
+Expected: the scale resolves 0.01 lb on its LCD and only sends a frame when that value changes.
 
 ### "Calibrate All split a 4 kg weight, only one scale's cal stuck"
 
 This was the concurrent-write race; fixed by `_AtomicCfgSection`. If you see it again, a regression has slipped in. Look at `_scale_cfg_section` usage in `server.py` — every read-modify-write of `scale_config.json` should go through it.
 
-### "Multi-point cal looks right but `weight_kg` doesn't match the points"
+### "Two legs read the same value when only one is loaded"
 
-1. **Order matters for the legacy derive.** The server sorts points by `weight_g` and uses min/max to derive `tare_offset` and `calibration_factor`. The interpolation itself uses the full sorted list. So: with 5 well-distributed points, interp is accurate; with 2 points where the heavy weight is `0.1 kg`, the legacy derive is fine but interp is just a single line.
-2. **Duplicate raw values.** `set_calibration_points` dedupes by `raw`, keeping the *last* entry per raw. If you logged the same point twice with different weights (typo), the last one wins. Watch the `[WARN]` line in the journal.
-3. **Out-of-range loads.** Loads outside the calibrated raw range get extrapolated using the slope of the nearest segment. Calibrate at the edges of your expected use range.
-
-### "Two scales read the same value when only one is loaded"
-
-Mechanical, not electrical. The koji table top is one rigid plate distributing across 4 cells — that's by design. **Center load splits ~25% per cell**. If pressing one corner moves all four cells, the load path is correct. If pressing one corner *also* moves the diagonal corner more than the adjacent ones, the table is twisting — check the housing torque and the cell mounting.
-
-### "HX711 read error: HX711 not responding -- check wiring!"
-
-The driver waits up to 1 s for `DAT` to go LOW (data-ready). If it never does:
-
-1. DAT pin not actually connected to HX711 OUT. Verify with continuity meter.
-2. HX711 not powered (5V/GND).
-3. The HX711 entered low-power mode — toggling CLK HIGH-then-LOW resets it. The driver does this automatically in `reset()`, but a flaky CLK line means it never lands.
-4. Wrong pins assigned in `scale_config.json` (you set DAT to a pin that's actually wired as CLK).
+Mechanical, not electrical. The koji table top is one rigid plate distributing across 4 legs — that's by design. **A center load splits ~25% per leg.**
 
 ---
 

@@ -1,6 +1,6 @@
 flask>=3.0
 gunicorn
+bleak>=0.22     # Bluetooth LE leg scales (ble_scales.py); needs BlueZ on the Pi
 
 # Pi-only (not needed for mock_server dev mode)
-# RPi.GPIO        # fan relay control, HX711 load cell bit-bang
-# hx711           # load_cell_hx711.py (custom driver, uses RPi.GPIO directly)
+# RPi.GPIO        # fan relay control

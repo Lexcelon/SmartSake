@@ -237,7 +237,7 @@ def api_sensor_status():
     try:
         import WriteSensors as ws
         tc_available  = ws._TC_AVAILABLE
-        hx_available  = ws._HX_AVAILABLE
+        scales_available = ws._SCALES_AVAILABLE
         sht_available = ws._SHT_AVAILABLE
         last_write_age = round(time.time() - ws._last_db_write_time, 1) if ws._last_db_write_time > 0 else None
         active_run_id  = ws._active_run_id
@@ -270,7 +270,7 @@ def api_sensor_status():
         "loop_status":        loop_status,
         "libs": {
             "thermocouples": tc_available,
-            "hx711_scales":  hx_available,
+            "ble_scales":    scales_available,
             "sht30":         sht_available,
         },
     })
@@ -321,17 +321,28 @@ def api_health():
     except Exception:
         pass
 
+    # BLE leg scales: "not_wired" = no address assigned, "disconnected" = link
+    # down past the grace period, "rezero_suspected" = scale probably power-cycled
+    # under load (re-tare/recalibrate to clear). Link details come from the
+    # sensor loop via sensor_latest.json["scale_status"].
+    link_status = raw.get("scale_status") or {}
     scales = {}
     for i in range(1, 5):
         cfg = scale_cfg.get(str(i), {})
-        if cfg.get("dat_pin") is None:
+        if not isinstance(cfg, dict) or not cfg.get("address"):
             scales[str(i)] = {"status": "not_wired"}
+            continue
+        link = link_status.get(str(i)) or {}
+        wkg = raw.get(f"weight_kg_{i}")
+        entry = {"address": cfg.get("address"), "connected": link.get("connected")}
+        if wkg is not None:
+            entry.update(status="rezero_suspected" if link.get("rezero_suspected") else "ok",
+                         weight_kg=wkg)
+        elif link.get("connected") is False:
+            entry.update(status="disconnected", error=link.get("last_error"))
         else:
-            wkg = raw.get(f"weight_kg_{i}")
-            if wkg is not None:
-                scales[str(i)] = {"status": "ok", "weight_kg": wkg}
-            else:
-                scales[str(i)] = {"status": "no_data"}
+            entry.update(status="no_data")
+        scales[str(i)] = entry
 
     # Relays
     relays = {}

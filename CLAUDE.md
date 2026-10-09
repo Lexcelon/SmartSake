@@ -26,7 +26,7 @@ The README is the single source of truth for setup, operations, and usage. If th
 - Generation delegated to non-Anthropic models; Claude plans and reviews
 - All hardware imports must degrade gracefully (try/except with warning, no crash). The pattern is: import inside a try block, set an `_AVAILABLE = False` sentinel, and let downstream code skip cleanly.
 - Relay logic is **active-LOW** (GPIO LOW = fan ON, GPIO HIGH = fan OFF). Boot state is HIGH.
-- Config files (`zone_config.json`, `tc_zone_map.json`, `scale_config.json`) are **hot-reloaded by mtime check** — no restart needed for config edits. The fan auto loop and HX711 threads pick up changes on the next tick.
+- Config files (`zone_config.json`, `tc_zone_map.json`, `scale_config.json`) are **hot-reloaded by mtime check** — no restart needed for config edits. The fan auto loop and scale reader threads pick up changes on the next tick (exception: a changed scale `address` needs a service restart).
 - JSON config writes go through atomic `os.replace(tmp, path)`. Read-modify-write paths in `server.py` are wrapped in `_AtomicCfgSection` (RLock) to prevent races during parallel calibration POSTs.
 
 ---
@@ -60,26 +60,31 @@ These do **not** survive reboot (tmpfs). On dev boxes with no `/run/smartsake/`,
 | `no_run_overrides.json` | gitignored | manual overrides when no run is active; survives `systemctl restart`, cleared on reboot |
 | `zone_config.json` | tracked | per-zone tolerance + optional setpoint_c. Hot-reloaded. |
 | `tc_zone_map.json` | tracked | `{1-Wire-device-id: zone_int}`. Hot-reloaded. |
-| `scale_config.json` | tracked | HX711 pins + tare/factor/calibration_points per scale. Hot-reloaded. |
+| `scale_config.json` | tracked | BLE `address` + tare (g)/factor/calibration_points per leg scale. Hot-reloaded (address changes need a restart). |
 
 ## GPIO map (BCM)
 
 ```
-Reserved:  2, 3 (I²C)   4 (1-Wire DQ)   5/6/12/15/16/19/20/21 (HX711)
+Reserved:  2, 3 (I²C)   4 (1-Wire DQ)
 Fan relays:
   Zone 1 → GPIO 25   Zone 4 → GPIO 22
   Zone 2 → GPIO 24   Zone 5 → GPIO 17
   Zone 3 → GPIO 23   Zone 6 → GPIO 27
-HX711 (DAT/CLK):
-  Scale 1: 5/6      Scale 3: 16/19
-  Scale 2: 12/15    Scale 4: 20/21
+Leg scales: Bluetooth LE (no GPIO) — see "BLE leg scales" below.
 ```
-Pin 15 is UART RXD0 — **disable the serial console** (`raspi-config` → Interface → Serial Port → No login shell, Yes hardware) or scale 2 will misbehave.
+
+## BLE leg scales
+
+- Four THINKSCALE 440 lb scales (BLE name `Chipsea_BLE`), one per table leg. Driver: `ble_scales.py` (bleak/BlueZ). One asyncio thread owns all BLE links; `WriteSensors.run_scale_thread` copies readings into `weight_state` every `WEIGHT_INTERVAL_S`.
+- Frames carry the scale's LCD segment map (decoded in `decode_frame`), always lb with 2 decimals. `raw` = scale reading in grams; tare/factor/multi-point apply on top (defaults 0 / 1.0 = passthrough).
+- Each scale accepts ONE connection — its wireless display must stay off. Only advertises its name after power-up; afterwards only to the last peer. A process lock (`/tmp/smartsake_ble_scales.lock`) stops two processes fighting over the scales.
+- Scales auto-zero at power-up → `rezero_suspected` flag (cleared by the next tare/calibration config change).
+- Offline: last value kept for `OFFLINE_GRACE_S` (600 s) after a disconnect, then `None` (blank).
 
 ## Timing constants
 
 - `SENSOR_INTERVAL_S = 10` (TC + SHT30 + fan tick)
-- `WEIGHT_INTERVAL_S = 30` (HX711 read cycle, per scale, in its own daemon thread)
+- `WEIGHT_INTERVAL_S = 5` (scale reader thread sample cycle; scales push frames on change)
 - `DEADBAND_HOLD = 1` (auto-fan transitions hold for ≥1 tick before committing — protects relay life)
 - `DEFAULT_TOLERANCE_C = 1.0` (used when zone_config has no tolerance for a zone)
 - `TC_OFFSET_MAX_ABS_C = 5.0` (rejected with 400 if an offset/cal would exceed this)
@@ -99,7 +104,7 @@ curl -s http://localhost:8080/api/system-health | jq
 
 For symptom → diagnostic flow → fix, see `DEBUG.md`:
 - **Automatic relay switching** — fan won't turn on/off, stuck on, or oscillating
-- **Load cell calibration** — wrong weight, drift, raw read failures, multi-point issues
+- **BLE leg scales** — blank/disconnected legs, re-zero warnings, wrong weight, calibration
 
 Both playbooks reference real symbols and file paths in this repo, so commands map straight to the running system.
 

@@ -4,7 +4,7 @@ SmartSake — API Input Fuzz Test
 
 Fires malformed / edge / extreme inputs at the Flask API endpoints using
 Flask's test_client (no port binding, no live hardware needed). Endpoints
-that require live HX711 raw reads are exercised by monkey-patching
+that require live scale raw reads are exercised by monkey-patching
 `server._latest_sensor_value`.
 
 Mirrors test_fan_state.py: plain `assert`, ANSI-coloured PASS/FAIL output,

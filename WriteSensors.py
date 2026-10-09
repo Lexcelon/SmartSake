@@ -46,11 +46,18 @@ except (ImportError, SyntaxError) as _e:
         return os.path.basename(device_folder)
 
 try:
-    from load_cell_hx711 import HX711, SAMPLES_PER_READ, load_scale_config, log_weight
-    _HX_AVAILABLE = True
+    import ble_scales
+    from ble_scales import load_scale_config, ScaleOffline
+    _SCALES_AVAILABLE = ble_scales.BLEAK_AVAILABLE
+    if not _SCALES_AVAILABLE:
+        print(f"[WARN] BLE scale libs not available ({ble_scales._BLEAK_IMPORT_ERROR}) "
+              f"— scale readings disabled (pip3 install bleak)")
 except ImportError as _e:
-    print(f"[WARN] HX711 libs not available ({_e}) — scale readings disabled")
-    _HX_AVAILABLE = False
+    print(f"[WARN] ble_scales not importable ({_e}) — scale readings disabled")
+    ble_scales = None
+    _SCALES_AVAILABLE = False
+    class ScaleOffline(Exception):
+        pass
     def load_scale_config(**kw): return {}
 
 try:
@@ -67,7 +74,7 @@ MAX_CSV_ROWS = 8640   # ~24 hrs at 10-second interval
 
 # ── Polling intervals ────────────────────────────────────────────────────────
 SENSOR_INTERVAL_S = 10   # TC + SHT30 + fan control + CSV/JSON/DB
-WEIGHT_INTERVAL_S = 30   # HX711 thread ADC read cycle
+WEIGHT_INTERVAL_S = 5    # BLE scale sample cycle (scales push on change; this just copies the latest)
 
 
 # ── systemd watchdog (sd_notify) ─────────────────────────────────────────────
@@ -101,7 +108,7 @@ _csv_line_count = None
 
 SHT30_TEMP_OFFSET_C = 0.0
 
-# Shared state updated by background HX711 threads, read by main sensor loop.
+# Shared state updated by background scale threads, read by main sensor loop.
 # Use _weight_lock when reading or writing to prevent torn reads.
 import threading as _threading
 _weight_lock = _threading.Lock()
@@ -993,25 +1000,27 @@ def read_sht30(sensor):
 SCALE_CONFIG_FILE = os.path.join(_BASE_DIR, "scale_config.json")
 
 
-_HX711_RAW_24BIT_RANGE = (-8388608, 8388607)
 _warned_scale_outliers = set()
 
 
 def _warn_scale_cfg_outliers(scale_id, tare, factor):
-    """Log once per (scale, field, value) when scale config holds suspect numerics."""
-    rmin, rmax = _HX711_RAW_24BIT_RANGE
-    if isinstance(tare, (int, float)) and not (rmin <= tare <= rmax):
+    """Log once per (scale, field, value) when scale config holds suspect numerics.
+
+    BLE scales report grams directly, so tare_offset is in grams and a sane
+    calibration_factor is close to 1.0. Values far off usually mean a leftover
+    HX711-era config (factor ~8000, tare in raw ADC counts)."""
+    if isinstance(tare, (int, float)) and abs(tare) > 200_000:   # > ~440 lb
         key = (scale_id, "tare_offset", tare)
         if key not in _warned_scale_outliers:
             _warned_scale_outliers.add(key)
-            print(f"[scale-cfg] WARN: scale {scale_id} tare_offset={tare} outside "
-                  f"24-bit HX711 range [{rmin}, {rmax}]")
-    if isinstance(factor, (int, float)) and 0 < abs(factor) < 1:
+            print(f"[scale-cfg] WARN: scale {scale_id} tare_offset={tare} g exceeds the "
+                  f"scale's 440 lb range — leftover HX711 value? Re-tare on the calibration page.")
+    if isinstance(factor, (int, float)) and not (0.5 <= factor <= 2.0):
         key = (scale_id, "calibration_factor", factor)
         if key not in _warned_scale_outliers:
             _warned_scale_outliers.add(key)
             print(f"[scale-cfg] WARN: scale {scale_id} calibration_factor={factor} "
-                  f"with |f|<1 — likely uncalibrated or wrong order of magnitude")
+                  f"is far from 1.0 — leftover HX711 value? Expect ~1.0 for BLE scales.")
 
 
 def _read_scale_cfg(scale_id):
@@ -1032,21 +1041,23 @@ def _read_scale_cfg(scale_id):
         return None
 
 
-_HX711_LOG_EVERY = 1   # write scale JSON every read (reads are every WEIGHT_INTERVAL_S)
+def run_scale_thread(scale_id, scale):
+    """Copy the latest BLE reading for one leg into weight_state every WEIGHT_INTERVAL_S.
 
-def run_hx711_thread(scale_id, hx_instance):
-    cfg = _read_scale_cfg(scale_id)
-    # Always read in kg internally — HX711.get_weight() now always returns kg.
-    # The "units" config field is kept for display purposes only.
+    The BLE connection itself lives in ble_scales' manager thread; this loop only
+    applies calibration (hot-reloaded from scale_config.json) and handles offline
+    scales by publishing None instead of a stale value.
+    """
     last_mtime = 0
-    _iter = 0
+    offline_reason = None
+    last_cal = _read_scale_cfg(scale_id)
     try:
         last_mtime = os.stat(SCALE_CONFIG_FILE).st_mtime_ns
     except Exception:
         pass
 
     try:
-        print(f"HX711 scale {scale_id} initialized.")
+        print(f"[scale {scale_id}] reader started.")
         while True:
             # Hot-reload tare/factor when scale_config.json changes on disk —
             # lets the calibration page update a running scale without a restart.
@@ -1057,40 +1068,56 @@ def run_hx711_thread(scale_id, hx_instance):
                     refreshed = _read_scale_cfg(scale_id)
                     if refreshed:
                         if refreshed[1] is not None:
-                            hx_instance._offset = float(refreshed[1])
+                            scale._offset = float(refreshed[1])
                         if refreshed[2] is not None:
-                            try:
-                                hx_instance.set_scale(float(refreshed[2]))
-                            except Exception:
-                                hx_instance._scale = float(refreshed[2])
-                        # Hot-reload multi-point calibration curve
+                            scale.set_scale(float(refreshed[2]))
                         cal_pts = refreshed[3]
                         if cal_pts and isinstance(cal_pts, list) and len(cal_pts) >= 2:
-                            hx_instance.set_calibration_points(cal_pts)
+                            scale.set_calibration_points(cal_pts)
                             print(f"[scale {scale_id}] reloaded multi-point calibration "
                                   f"({len(cal_pts)} points)")
                         else:
-                            hx_instance._cal_points = []
+                            scale._cal_points = []
                             print(f"[scale {scale_id}] reloaded calibration "
                                   f"(tare={refreshed[1]}, factor={refreshed[2]})")
+                        # A new tare/calibration for THIS leg is the operator's answer
+                        # to a suspected power-on re-zero, so clear that warning.
+                        if refreshed != last_cal and hasattr(scale, "clear_rezero_flag"):
+                            scale.clear_rezero_flag()
+                        last_cal = refreshed
             except Exception:
                 pass
 
             try:
-                weight, raw_avg = hx_instance.get_weight(samples=SAMPLES_PER_READ)
+                weight, raw = scale.get_weight()
                 with _weight_lock:
                     weight_state[scale_id]['kg'] = weight
-                    weight_state[scale_id]['raw'] = raw_avg
-                # Throttle per-scale JSON writes — weight_state (in-memory) is the
-                # primary data path; these files are a secondary log.
-                if _iter % _HX711_LOG_EVERY == 0:
-                    log_weight(scale_id, weight, "kg")
+                    weight_state[scale_id]['raw'] = raw
+                if offline_reason is not None:
+                    print(f"[scale {scale_id}] back online.")
+                    offline_reason = None
+            except ScaleOffline as e:
+                with _weight_lock:
+                    weight_state[scale_id]['kg'] = None
+                    weight_state[scale_id]['raw'] = None
+                if str(e) != offline_reason:
+                    offline_reason = str(e)
+                    print(f"[scale {scale_id}] no reading: {e}")
             except Exception as e:
-                print(f"HX711 scale {scale_id} read error: {e}")
-            _iter += 1
+                print(f"[scale {scale_id}] read error: {e}")
             time.sleep(WEIGHT_INTERVAL_S)
     except Exception as e:
-        print(f"HX711 scale {scale_id} thread failed: {e} -- running without scale")
+        print(f"[scale {scale_id}] thread failed: {e} -- running without this scale")
+
+
+def _scale_status_snapshot():
+    """Per-leg BLE link status for sensor_latest.json (read by /api/health)."""
+    if ble_scales is None:
+        return {}
+    try:
+        return {str(sid): st for sid, st in ble_scales.get_status().items()}
+    except Exception:
+        return {}
 
 
 def write_csv(timestamp, sht_temp, sht_humidity, tc_readings):
@@ -1172,6 +1199,7 @@ def write_json(timestamp, sht_temp, sht_humidity, tc_readings):
         "weight_raw_2": round(ws[2]['raw'], 1) if ws[2]['raw'] is not None else None,
         "weight_raw_3": round(ws[3]['raw'], 1) if ws[3]['raw'] is not None else None,
         "weight_raw_4": round(ws[4]['raw'], 1) if ws[4]['raw'] is not None else None,
+        "scale_status": _scale_status_snapshot(),
         "zones": {}
     }
     tmp_file = JSON_FILE + ".tmp"
@@ -1274,15 +1302,17 @@ def start_sensor_loop():
 
     threading.Thread(target=_watchdog_thread, daemon=True).start()
 
-    # Start one HX711 thread per configured scale
+    # Connect to the BLE leg scales (one shared BLE thread) and start one
+    # reader thread per configured leg.
     _scale_instances = {}
-    if _HX_AVAILABLE:
+    if _SCALES_AVAILABLE:
         try:
             _scale_instances = load_scale_config()
         except Exception as e:
-            print(f"[sensors] Could not load scale_config.json: {e} — running without scales")
-    for _sid, _hx in _scale_instances.items():
-        threading.Thread(target=run_hx711_thread, args=(_sid, _hx), daemon=True).start()
+            print(f"[sensors] Could not start BLE scales: {e} — running without scales")
+    for _sid, _scale in _scale_instances.items():
+        threading.Thread(target=run_scale_thread, args=(_sid, _scale), daemon=True,
+                         name=f"scale-{_sid}").start()
 
     # Load SHT30 calibration offset from scale_config.json
     try:

@@ -11,7 +11,7 @@ Usage:
     python3 test_failure_injection.py
 
 Hardware libs (RPi.GPIO, adafruit, etc.) are NOT required. We stub them at
-import time so HX711 can be exercised on Windows / dev boxes.
+import time so GPIO-dependent modules import on Windows / dev boxes.
 """
 
 import io
@@ -54,10 +54,7 @@ if os.name == "nt":
         pass
 
 
-# ── Mock RPi.GPIO so load_cell_hx711 imports cleanly on dev boxes ───────────
-# Without this, `import load_cell_hx711` would ImportError on Windows because
-# the module imports `RPi.GPIO` at top level (unguarded). fan_gpio already
-# guards its own import; we only need the stub for the HX711 path.
+# ── Mock RPi.GPIO so GPIO-dependent code imports cleanly on dev boxes ───────
 if "RPi" not in sys.modules:
     rpi_mod = types.ModuleType("RPi")
     gpio_mod = types.ModuleType("RPi.GPIO")
@@ -81,15 +78,6 @@ if "RPi" not in sys.modules:
 import WriteSensors as ws  # noqa: E402
 import db as sakedb        # noqa: E402
 import fan_gpio            # noqa: E402
-
-# load_cell_hx711 is exercised in the HX711 failure test only.
-try:
-    import load_cell_hx711 as hx711_mod  # noqa: E402
-    _HX711_IMPORTABLE = True
-except Exception as _e:
-    _HX711_IMPORTABLE = False
-    _HX711_IMPORT_ERR = _e
-
 
 # ── Mock infrastructure ─────────────────────────────────────────────────────
 _set_fan_calls = []  # captures (zone, on) tuples
@@ -369,68 +357,61 @@ def test_read_temp_c_raises_loop_continues():
     assert "1-Wire bus hung" in log_text, "expected underlying error in log"
 
 
-def test_hx711_get_weight_raises_thread_recovers():
-    """HX711.get_weight() raising must not kill the weight thread.
+def test_scale_get_weight_raises_thread_recovers():
+    """A scale reader error must not kill the weight thread.
 
-    The thread's inner try/except (run_hx711_thread) logs the error and
-    continues to the next interval. We exercise it by stubbing get_weight
-    to raise once, then return a valid value, and verifying the thread
-    wrote the second reading to weight_state.
+    run_scale_thread logs a generic exception and keeps going; a ScaleOffline
+    (BLE link down past the grace period) publishes None instead of a stale value.
+    We stub get_weight to raise a generic error, then ScaleOffline, then return
+    a valid value, and verify each outcome lands in weight_state.
     """
-    if not _HX711_IMPORTABLE:
-        # Should not happen given our RPi stub, but skip gracefully.
-        print(f"        {DIM}[skipped: load_cell_hx711 not importable: {_HX711_IMPORT_ERR}]{RESET}")
-        return
-
-    class _FlakyHX:
+    class _FlakyScale:
         def __init__(self):
             self.calls = 0
             self._offset = 0
             self._scale = 1.0
             self._cal_points = []
-        def get_weight(self, samples=10, units="kg"):
+            self.seen = []
+        def get_weight(self, samples=None, units="kg"):
             self.calls += 1
             if self.calls == 1:
-                raise TimeoutError("HX711 not responding")
-            return 1.234, 100000.0
+                raise RuntimeError("BLE stack hiccup")
+            if self.calls == 2:
+                raise ws.ScaleOffline("disconnected for 900s")
+            return 1.234, 1234.0
         def set_scale(self, factor): self._scale = factor
         def set_calibration_points(self, pts): pass
 
-    flaky = _FlakyHX()
+    flaky = _FlakyScale()
+    ws.weight_state[1]["kg"] = 9.99   # stale value that must be cleared by ScaleOffline
 
-    # Stop the thread loop after we've seen 2 calls. Easiest way is to
-    # patch time.sleep inside the WriteSensors-imported `time` module to
-    # raise once flaky.calls >= 2 — that breaks out of the outer try and
-    # exits run_hx711_thread cleanly.
     sentinel = RuntimeError("__stop_thread__")
     real_sleep = time.sleep
     def _gated_sleep(s):
-        if flaky.calls >= 2:
+        if flaky.calls == 2:
+            flaky.seen.append(ws.weight_state[1]["kg"])
+        if flaky.calls >= 3:
             raise sentinel
-        # don't actually wait — let the loop spin to the next read fast
         return None
     ws.time.sleep = _gated_sleep
-
-    # Also drop WEIGHT_INTERVAL_S to 0 so the thread doesn't dawdle.
     orig_interval = ws.WEIGHT_INTERVAL_S
     ws.WEIGHT_INTERVAL_S = 0
 
     log_buf = io.StringIO()
     try:
-        # Run on the calling thread so any hang surfaces as a real failure.
         with contextlib.redirect_stdout(log_buf):
-            ws.run_hx711_thread(1, flaky)
+            ws.run_scale_thread(1, flaky)
     finally:
         ws.time.sleep = real_sleep
         ws.WEIGHT_INTERVAL_S = orig_interval
 
     log_text = log_buf.getvalue()
-    assert flaky.calls >= 2, f"expected ≥2 get_weight calls, got {flaky.calls}"
-    assert "HX711 scale 1 read error" in log_text, (
+    assert flaky.calls >= 3, f"expected ≥3 get_weight calls, got {flaky.calls}"
+    assert "[scale 1] read error: BLE stack hiccup" in log_text, (
         f"expected per-iteration error log; stdout: {log_text!r}"
     )
-    assert "HX711 not responding" in log_text, "underlying error must surface"
-    # Second read succeeded → weight_state must reflect it.
+    assert "[scale 1] no reading: disconnected" in log_text, "offline reason must be logged"
+    assert flaky.seen == [None], f"ScaleOffline must clear stale weight, saw {flaky.seen}"
     assert ws.weight_state[1]["kg"] == 1.234, (
         f"weight_state[1].kg should be 1.234 after recovery, got {ws.weight_state[1]['kg']}"
     )
@@ -718,7 +699,7 @@ TESTS = [
     ("insert_reading fails — _active_run_id preserved, retried",   test_insert_reading_failure_preserves_active_run_id),
     ("all TCs return None — no crash, mode=none for all zones",    test_all_tcs_none_no_crash),
     ("read_temp_c raises — per-probe loop catches, sets None",     test_read_temp_c_raises_loop_continues),
-    ("HX711.get_weight raises — thread recovers next interval",    test_hx711_get_weight_raises_thread_recovers),
+    ("scale.get_weight raises — thread recovers next interval",    test_scale_get_weight_raises_thread_recovers),
     ("read_sht30 raises — values stay None, no alarms fire",       test_read_sht30_raises_no_alarms),
     ("get_active_run returns malformed row — outer except catches",test_get_active_run_malformed_row),
     ("_load_zone_config raises — defaults used",                   test_load_zone_config_raises_uses_defaults),

@@ -59,9 +59,8 @@ if os.name == "nt":
 
 
 # ── Mock RPi.GPIO before importing anything that touches it ─────────────────
-# load_cell_hx711.py does an unconditional `import RPi.GPIO as GPIO`. WriteSensors
-# already wraps that import in try/except, but mocking explicitly keeps the test
-# deterministic and lets future imports still find the symbol.
+# fan_gpio wraps its RPi.GPIO import in try/except, but mocking explicitly keeps
+# the test deterministic and lets future imports still find the symbol.
 def _install_rpi_gpio_mock():
     if "RPi" in sys.modules:
         return

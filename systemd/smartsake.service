@@ -1,7 +1,8 @@
 [Unit]
 Description=SmartSake — web server + sensor collector
-# No network dependency: everything is local (SQLite, GPIO, 1-Wire, I2C)
-After=local-fs.target
+# No network dependency: everything is local (SQLite, GPIO, 1-Wire, I2C, Bluetooth)
+After=local-fs.target bluetooth.target
+Wants=bluetooth.target
 
 [Service]
 Type=simple

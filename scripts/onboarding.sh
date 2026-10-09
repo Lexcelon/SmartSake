@@ -209,16 +209,17 @@ for did, ch in sorted(m.items(), key=lambda x: x[1]):
 
     echo ""
 
-    # ── 2.4 Optional: Load cell calibration ──────────────────────────────────
-    info "Load cell calibration (optional)."
-    echo "  If you have HX711 load cells wired (DAT→GPIO5, CLK→GPIO6),"
-    echo "  you can calibrate them now."
+    # ── 2.4 Optional: Bluetooth leg scales ───────────────────────────────────
+    info "Bluetooth leg scales (optional)."
+    echo "  Assign each table leg's THINKSCALE (Chipsea_BLE) scale. Keep the scales'"
+    echo "  wireless displays switched OFF — each scale accepts only one connection."
     echo ""
-    read -rp "  Calibrate load cell? [y/N] " CAL_ANSWER
+    read -rp "  Assign leg scales now? [y/N] " CAL_ANSWER
     if [[ "${CAL_ANSWER,,}" == "y" ]]; then
-        sudo -u "$CURRENT_USER" python3 "$REPO_DIR/load_cell_hx711.py" --calibrate --scale 1
+        systemctl stop smartsake.service 2>/dev/null || true
+        sudo -u "$CURRENT_USER" python3 "$REPO_DIR/ble_scales.py" setup
     else
-        ok "Skipping load cell calibration (can run later: python3 load_cell_hx711.py --calibrate --scale 1)"
+        ok "Skipping scale assignment (run later: python3 ble_scales.py setup)"
     fi
 
     echo ""
@@ -239,7 +240,8 @@ for did, ch in sorted(m.items(), key=lambda x: x[1]):
         cat > "$INSTALL_DIR/smartsake.service" <<EOF
 [Unit]
 Description=SmartSake — web server + sensor collector
-After=local-fs.target
+After=local-fs.target bluetooth.target
+Wants=bluetooth.target
 
 [Service]
 Type=simple
@@ -315,8 +317,18 @@ else
         i2c-tools \
         git \
         sqlite3 \
-        bc
+        bc \
+        bluez
     ok "System packages installed."
+
+    # Bluetooth for the BLE leg scales: make sure the radio is on and the
+    # service user may talk to BlueZ over D-Bus.
+    if $IS_PI; then
+        rfkill unblock bluetooth 2>/dev/null || true
+        systemctl enable --now bluetooth.service 2>/dev/null || true
+        usermod -aG bluetooth "$CURRENT_USER" 2>/dev/null || true
+        ok "Bluetooth enabled; $CURRENT_USER added to the 'bluetooth' group."
+    fi
 
     # ── 1.2 Python packages ──────────────────────────────────────────────────
     info "Installing Python packages..."
@@ -332,7 +344,8 @@ else
         gunicorn \
         RPi.GPIO \
         adafruit-blinka \
-        adafruit-circuitpython-sht31d
+        adafruit-circuitpython-sht31d \
+        bleak
 
     ok "Python packages installed."
 
@@ -386,7 +399,8 @@ else
     echo ""
     echo "  What was done:"
     echo "    ✓ System packages (python3, i2c-tools, sqlite3, bc)"
-    echo "    ✓ Python packages (flask, RPi.GPIO, adafruit libs)"
+    echo "    ✓ Python packages (flask, RPi.GPIO, adafruit libs, bleak)"
+    echo "    ✓ Bluetooth enabled (for the BLE leg scales)"
     echo "    ✓ I2C enabled (for SHT30 humidity sensor)"
     echo "    ✓ 1-Wire enabled (for MAX31850K thermocouples on GPIO 4)"
     echo "    ✓ Runtime directory created (/run/smartsake)"
@@ -398,7 +412,7 @@ else
     echo -e "  ${YELLOW}  It will auto-detect the active bus and start Phase 2:${NC}"
     echo -e "  ${YELLOW}    → Thermocouple identification (zone mapping)${NC}"
     echo -e "  ${YELLOW}    → SHT30 verification${NC}"
-    echo -e "  ${YELLOW}    → Optional load cell calibration${NC}"
+    echo -e "  ${YELLOW}    → Optional Bluetooth leg-scale assignment${NC}"
     echo -e "  ${YELLOW}    → Service install and startup${NC}"
     echo -e "  ${YELLOW}═══════════════════════════════════════════════════════════${NC}"
     echo ""

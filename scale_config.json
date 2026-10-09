@@ -1,28 +1,8 @@
 {
   "scales": {
-    "1": {
-      "dat_pin": 5,
-      "clk_pin": 6,
-      "tare_offset": 397,
-      "calibration_factor": 8000.0
-    },
-    "2": {
-      "dat_pin": 12,
-      "clk_pin": 15,
-      "tare_offset": 1023,
-      "calibration_factor": 8000.0
-    },
-    "3": {
-      "dat_pin": 16,
-      "clk_pin": 19,
-      "tare_offset": 5324,
-      "calibration_factor": 8000.0
-    },
-    "4": {
-      "dat_pin": 20,
-      "clk_pin": 21,
-      "tare_offset": 298,
-      "calibration_factor": 8000.0
-    }
+    "1": {"address": null, "label": "Leg 1", "tare_offset": 0, "calibration_factor": 1.0},
+    "2": {"address": null, "label": "Leg 2", "tare_offset": 0, "calibration_factor": 1.0},
+    "3": {"address": null, "label": "Leg 3", "tare_offset": 0, "calibration_factor": 1.0},
+    "4": {"address": null, "label": "Leg 4", "tare_offset": 0, "calibration_factor": 1.0}
   }
 }

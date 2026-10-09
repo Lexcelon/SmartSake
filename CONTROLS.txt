@@ -71,15 +71,21 @@ Fresh clone (if pull fails):
   CALIBRATION
 ------------------------------------------------------------
 
-List all scales (shows wired/calibrated status):
-  source .venv/bin/activate
-  python load_cell_hx711.py --list
+Bluetooth leg scales (keep the scales' wireless displays OFF):
 
-Calibrate a load cell (replace N with 1, 2, 3, or 4):
-  python load_cell_hx711.py --calibrate --scale N
+List legs (address + calibration):
+  python3 ble_scales.py list
 
-Re-tare a load cell (zero it without full calibration):
-  python load_cell_hx711.py --tare --scale N
+Assign scales to legs (guided — plug in one scale at a time):
+  sudo systemctl stop smartsake
+  python3 ble_scales.py setup
+  sudo systemctl start smartsake
+
+Live scale readings without the web app (service stopped):
+  python3 ble_scales.py monitor
+
+Tare / calibrate a leg: open http://<pi-ip>:8080/calibration.html
+  (or: curl -X POST http://localhost:8080/api/scale-config/N/tare)
 
 Calibrate SHT30 ambient sensor (replace XX.X with reference thermometer reading):
   python calibrate_sht30.py XX.X
@@ -93,8 +99,8 @@ Test everything:
   source .venv/bin/activate
   python test_hardware.py --all
 
-Test a specific scale:
-  python test_hardware.py --scale N
+Test the BLE scale driver (no hardware needed):
+  python3 test_ble_scales.py
 
 Test a specific fan relay zone:
   python test_hardware.py --zone N
@@ -125,7 +131,7 @@ Check what is running on port 8080:
 Check for rogue sensor/server processes:
   ps aux | grep -E "server|gunicorn|WriteSensors" | grep -v grep
 
-Check scale pin assignments and calibration:
+Check leg scale addresses and calibration:
   cat ~/MainCode/scale_config.json
 
 Check thermocouple zone map:

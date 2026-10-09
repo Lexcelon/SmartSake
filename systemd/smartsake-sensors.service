@@ -3,7 +3,8 @@
 # loop as a background thread inside server.py and does not need this.
 [Unit]
 Description=SmartSake Sensor Collector (standalone)
-After=local-fs.target
+After=local-fs.target bluetooth.target
+Wants=bluetooth.target
 # Don't run alongside the main service — it already has the sensor loop
 Conflicts=smartsake.service
 

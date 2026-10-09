@@ -3,7 +3,7 @@
 SmartSake — Standalone Fan State Machine Smoke Test
 
 Exercises the fan state machine paths in WriteSensors.py that have produced
-bugs. Mirrors the standalone style of test_scales.py — plain `assert`,
+bugs. Mirrors the standalone style of the other test_*.py tools — plain `assert`,
 ANSI-coloured PASS/FAIL output, no pytest/unittest dependency.
 
 Usage:
@@ -23,7 +23,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 
-# ── ANSI helpers (match test_scales.py) ─────────────────────────────────────
+# ── ANSI helpers ─────────────────────────────────────────────────────────────
 BOLD    = "\033[1m"
 DIM     = "\033[2m"
 GREEN   = "\033[32m"
@@ -42,7 +42,7 @@ if os.name == "nt":
     except Exception:
         pass
     # Reconfigure stdout/stderr to utf-8 so any non-ASCII output (e.g. the
-    # horizontal-line glyph used by test_scales.py) doesn't crash the print
+    # horizontal-line glyph used by these tests) doesn't crash the print
     # call under the cp1252 default Windows console codepage.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")

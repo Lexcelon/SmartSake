@@ -1118,8 +1118,8 @@
 								tbody.innerHTML = '';
 								function _dot(status) {
 									var color = status === 'ok' || status === 'wired' ? 'var(--color-success)' :
-												status === 'no_data' ? 'var(--color-warning)' :
-												status === 'error' ? 'var(--color-critical)' :
+												status === 'no_data' || status === 'rezero_suspected' ? 'var(--color-warning)' :
+												status === 'error' || status === 'disconnected' ? 'var(--color-critical)' :
 												'var(--color-text-2)';
 									return '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:' + color + ';margin-right:5px;vertical-align:middle;"></span>';
 								}

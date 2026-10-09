@@ -248,6 +248,8 @@
     <div class="panel">
       <h2>Load Cells</h2>
       <p class="panel-help">
+        Each leg sits on a Bluetooth scale (assign them with <code>python3 ble_scales.py setup</code>).
+        <b>Raw</b> is what the scale itself reads, in grams; with Tare 0 and Factor 1.0 the live value equals the scale's display.
         <b>Tare</b>: clear the scale, click Tare. <b>Calibrate</b>: place a known weight, type its mass in kg, click Calibrate.
         The running scale picks up the new tare/factor automatically — no service restart needed.
       </p>
@@ -573,7 +575,7 @@
       var tdTare = el('td');
       var tareInp = el('input', { attrs: { type: 'number', step: '1',
                                            'data-role': 'tare-input',
-                                           title: 'Tare offset (raw counts) — editable' } });
+                                           title: 'Tare offset (grams, as read by the scale) — editable' } });
       tdTare.appendChild(tareInp); tr.appendChild(tdTare);
 
       // Editable Factor cell
@@ -638,9 +640,9 @@
       var sc = (_scaleCfg.scales || {})[String(s)] || {};
       var kg = _latest['weight_lbs_' + s] != null ? _latest['weight_lbs_' + s] / 2.20462 : null;
       var raw = _latest['weight_raw_' + s];
-      var notWired = sc.dat_pin == null || sc.clk_pin == null;
+      var notWired = !sc.address;
 
-      row.querySelector('[data-role="kg"]').textContent   = notWired ? '— (not wired)' : fmtNum(kg, 3);
+      row.querySelector('[data-role="kg"]').textContent   = notWired ? '— (not assigned)' : fmtNum(kg, 3);
       row.querySelector('[data-role="raw"]').textContent  = fmtNum(raw, 0);
 
       // Tare and Factor are editable inputs — only sync from saved config when
@@ -1078,7 +1080,7 @@
     var scales = (_scaleCfg && _scaleCfg.scales) || {};
     for (var s = 1; s <= 4; s++) {
       var sc = scales[String(s)] || {};
-      var notWired = (sc.dat_pin == null) || (sc.clk_pin == null);
+      var notWired = !sc.address;
       if (!notWired) ids.push(s);
     }
     return ids;
@@ -1087,7 +1089,7 @@
   function summarizePerScale(results) {
     // results: [{sid, ok, body|err}]
     return results.map(function (r) {
-      if (r.skipped)  return 'S' + r.sid + ' not wired';
+      if (r.skipped)  return 'S' + r.sid + ' not assigned';
       if (r.ok)       return 'S' + r.sid + ' ok';
       var msg = (r.body && r.body.error) ? r.body.error : (r.err || 'failed');
       return 'S' + r.sid + ' err (' + msg + ')';
@@ -1111,7 +1113,7 @@
     var calBtn  = document.getElementById('cal-all-calibrate-btn');
     var ids = wiredScaleIds();
     if (ids.length === 0) {
-      setStatus('cal-all-tare-status', 'No wired scales found.', false);
+      setStatus('cal-all-tare-status', 'No scales assigned (run ble_scales.py setup).', false);
       setStatus('cal-all-status', '', null);
       return;
     }
@@ -1153,7 +1155,7 @@
     }
     var ids = wiredScaleIds();
     if (ids.length === 0) {
-      setStatus('cal-all-calibrate-status', 'No wired scales found.', false);
+      setStatus('cal-all-calibrate-status', 'No scales assigned (run ble_scales.py setup).', false);
       return;
     }
     var divisor = (ids.length >= 4) ? 4 : ids.length;
@@ -1325,7 +1327,7 @@
     html += '</div>';
 
     html += '<div class="scale-cal-charts">';
-    html += '<div class="scale-cal-chart-wrap"><div class="chart-title">Raw ADC (last ' + SCALE_WINDOW + ' samples)</div>';
+    html += '<div class="scale-cal-chart-wrap"><div class="chart-title">Raw scale reading, g (last ' + SCALE_WINDOW + ' samples)</div>';
     html += '<canvas id="scale-chart-raw-' + sid + '"></canvas></div>';
     html += '<div class="scale-cal-chart-wrap"><div class="chart-title">Computed weight (kg) &mdash; current saved cal</div>';
     html += '<canvas id="scale-chart-kg-' + sid + '"></canvas></div>';
@@ -1406,7 +1408,7 @@
     _scaleCharts.raw = new Chart(rawCtx, {
       type: 'line',
       data: { datasets: [{
-        label: 'Raw ADC', data: _scaleSeriesRaw,
+        label: 'Raw (g)', data: _scaleSeriesRaw,
         borderColor: c.brand, borderWidth: 2, pointRadius: 0, tension: 0.25
       }]},
       options: commonOpts('Raw counts')

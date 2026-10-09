@@ -3,7 +3,34 @@
 All notable changes to SmartSake. Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project does not currently version semver-style, so entries are grouped by date.
 
-## [Unreleased] — 2026-05-09
+## [Unreleased] — 2026-10-09 — Bluetooth leg scales (branch `ble-scales`)
+
+### Changed
+- **Weight now comes from four Bluetooth LE scales** (THINKSCALE 440 lb, BLE name `Chipsea_BLE`),
+  one under each table leg, instead of FX29 load cells + HX711 amplifiers. New driver
+  `ble_scales.py` (bleak/BlueZ) holds one connection per scale from a single asyncio thread and
+  decodes the scale's LCD-segment frames. `WriteSensors.run_hx711_thread` → `run_scale_thread`;
+  `WEIGHT_INTERVAL_S` 30 s → 5 s. The data contract (`weight_state`, `weight_kg_N`,
+  `weight_raw_N`, DB `weight_lbs_N`) is unchanged, so dashboard/analytics need no changes.
+- **`scale_config.json` schema**: `dat_pin`/`clk_pin` replaced by `address` (BLE MAC).
+  `tare_offset` is now grams and `calibration_factor` ≈ 1.0 (defaults = scale's own reading).
+  Calibration page/API (tare, calibrate, multi-point) work unchanged on top of it.
+- `/api/health` scale statuses: `not_wired` (no address), `ok`, `disconnected`, `no_data`,
+  `rezero_suspected`. `/api/sensor-status` `libs.hx711_scales` → `libs.ble_scales`.
+  `sensor_latest.json` gains `scale_status` (per-leg link details).
+- `smartsake.service` (and the onboarding-generated unit) start after `bluetooth.target`;
+  onboarding installs `bluez` + `bleak`, unblocks the radio and adds the user to `bluetooth`.
+
+### Added
+- `ble_scales.py` CLI: `scan`, `setup` (guided leg assignment), `assign`, `list`, `monitor`.
+- Power-cycle re-zero detection (scales auto-zero at power-up) with a health warning.
+- `test_ble_scales.py` — decoder (frames captured from a real scale), reassembly, calibration,
+  offline/grace, re-zero, and connection manager against a fake BLE stack.
+
+### Removed
+- `load_cell_hx711.py`, `test_scales.py` (HX711 driver / bench tool). HX711 GPIO pins are free.
+
+## [2026-05-09]
 
 ### Added
 - **`POST /api/zone-config/all`** — atomic blanket update endpoint. Body `{setpoint_c?, tolerance_c?}`

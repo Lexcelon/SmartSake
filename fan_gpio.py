@@ -15,7 +15,7 @@ import logging
 log = logging.getLogger(__name__)
 
 # BCM pin assignments for SunFounder TS0012 relay channels.
-# Avoids reserved pins: I2C=2/3, 1-Wire=4, HX711 Scale1=5/6.
+# Avoids reserved pins: I2C=2/3, 1-Wire=4. (Scales are Bluetooth now — no GPIO.)
 # Verify against your physical wiring before first run.
 FAN_PINS = {
     1: 25,
